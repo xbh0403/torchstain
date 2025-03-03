@@ -215,48 +215,31 @@ class BatchHENormalizer:
     def process_folder(self, input_folder, output_folder=None, batch_size=4, num_workers=4, 
                        fit_target=None, **kwargs):
         """
-        Process all images in a folder.
+        Process all images in a folder with the normalizer.
         
         Args:
-            input_folder: Path to the folder containing images to normalize
-            output_folder: Path to save the normalized images. If None, overwrite original images.
+            input_folder: Path to folder containing images to normalize
+            output_folder: Path to save normalized images (if None, overwrites original)
             batch_size: Number of images to process at once
-            num_workers: Number of parallel workers for loading images
-            fit_target: Path to a target image or folder of target images for fitting
-            **kwargs: Additional arguments to pass to the normalizer's methods
+            num_workers: Number of parallel workers for loading/saving images
+            fit_target: Path to target image for normalization reference (if None, fits to first batch)
+            **kwargs: Additional parameters to pass to the normalizer
         """
-        # Setup transforms
+        # Setup transform for image loading
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Lambda(lambda x: x * 255)  # Scale to [0, 255] range
         ])
         
-        # Fit the normalizer if a target is provided
+        # First fit the normalizer if a target is provided
         if fit_target is not None:
-            if os.path.isdir(fit_target):
-                # Fit using all images in the target folder
-                target_files = [f for f in os.listdir(fit_target) 
-                               if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff'))]
-                target_images = []
-                
-                print(f"Loading {len(target_files)} target images for fitting...")
-                for f in target_files:
-                    img = Image.open(os.path.join(fit_target, f))
-                    if img.mode != 'RGB':
-                        img = img.convert('RGB')
-                    img_tensor = transform(img).byte()
-                    target_images.append(img_tensor)
-                
-                print("Fitting normalizer to target images...")
-                self.fit(target_images, **kwargs)
-            else:
-                # Fit using a single target image
-                print(f"Loading target image for fitting: {fit_target}")
-                img = Image.open(fit_target)
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
-                img_tensor = transform(img).byte()
-                self.fit(img_tensor, **kwargs)
+            print(f"Fitting normalizer to target: {fit_target}")
+            target_image = Image.open(fit_target).convert('RGB')
+            # Define transform here to ensure consistency
+            target_tensor = transform(target_image).byte()
+            
+            # Pass the target tensor directly to fit - the method will handle device conversion
+            self.fit(target_tensor, **kwargs)
         
         # Create output folder if specified
         if output_folder is not None:
@@ -272,54 +255,58 @@ class BatchHENormalizer:
         print(f"Found {len(image_files)} images to process")
         print(f"Processing in batches of {batch_size} images")
         
-        # Process images in batches
-        for i in tqdm(range(0, len(image_files), batch_size), desc="Processing batches"):
-            batch_files = image_files[i:i+batch_size]
-            
-            # Load images in parallel
-            batch_images = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-                futures = {executor.submit(self._load_image, os.path.join(input_folder, f), transform): f 
-                          for f in batch_files}
-                for future in concurrent.futures.as_completed(futures):
-                    file_name = futures[future]
+        # Create a thread pool for saving that will run in the background
+        all_save_futures = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as save_executor:
+            # Process images in batches
+            for i in tqdm(range(0, len(image_files), batch_size), desc="Processing batches"):
+                batch_files = image_files[i:i+batch_size]
+                
+                # Load images in parallel
+                batch_images = []
+                with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+                    futures = {executor.submit(self._load_image, os.path.join(input_folder, f), transform): f 
+                            for f in batch_files}
+                    for future in concurrent.futures.as_completed(futures):
+                        file_name = futures[future]
+                        try:
+                            img_tensor = future.result()
+                            if img_tensor is not None:
+                                batch_images.append((img_tensor, file_name))
+                        except Exception as e:
+                            print(f"Error loading {file_name}: {e}")
+                
+                # Normalize the batch
+                normalized_batch = []
+                for img_tensor, file_name in batch_images:
                     try:
-                        img_tensor = future.result()
-                        if img_tensor is not None:
-                            batch_images.append((img_tensor, file_name))
+                        normalized = self.normalize_image(img_tensor, **kwargs)
+                        normalized_batch.append((normalized, file_name))
                     except Exception as e:
-                        print(f"Error loading {file_name}: {e}")
+                        print(f"Error normalizing {file_name}: {e}")
+                
+                # Submit save operations to run in background
+                for normalized, file_name in normalized_batch:
+                    future = save_executor.submit(
+                        self._save_image,
+                        normalized,
+                        file_name,
+                        output_folder if output_folder else input_folder
+                    )
+                    all_save_futures[future] = file_name
             
-            # Normalize the batch
-            normalized_batch = []
-            for img_tensor, file_name in batch_images:
+            # Now that all batches are processed, wait for all save operations to complete
+            print("All normalization complete. Waiting for remaining save operations to finish...")
+            for future in tqdm(concurrent.futures.as_completed(all_save_futures), 
+                               total=len(all_save_futures), 
+                               desc="Finishing save operations"):
+                file_name = all_save_futures[future]
                 try:
-                    normalized = self.normalize_image(img_tensor, **kwargs)
-                    normalized_batch.append((normalized, file_name))
-                except Exception as e:
-                    print(f"Error normalizing {file_name}: {e}")
-            
-            # Save results
-            for normalized, file_name in normalized_batch:
-                try:
-                    # Ensure the normalized tensor has the correct dimensions [C,H,W] and 3 channels
-                    if normalized.dim() != 3 or normalized.shape[0] != 3:
-                        print(f"Warning: Normalized tensor for {file_name} has unexpected shape: {normalized.shape}")
-                        # Try to reshape if needed
-                        if normalized.shape[0] == 1 and normalized.dim() == 3:
-                            # Grayscale image - convert to 3 channels
-                            normalized = normalized.repeat(3, 1, 1)
-                        elif normalized.dim() > 3:
-                            # Too many dimensions - squeeze out extra dimensions
-                            normalized = normalized.squeeze()
-                        
-                    # Convert to PIL for saving, ensuring byte format and proper range [0,255]
-                    normalized = torch.clamp(normalized, 0, 255).byte()
-                    img = transforms.ToPILImage()(normalized)
-                    save_path = os.path.join(output_folder if output_folder else input_folder, file_name)
-                    img.save(save_path)
+                    future.result()
                 except Exception as e:
                     print(f"Error saving {file_name}: {e}")
+        
+        print("All operations completed.")
     
     @staticmethod
     def _load_image(image_path, transform):
@@ -343,6 +330,25 @@ class BatchHENormalizer:
         except Exception as e:
             print(f"Error loading {image_path}: {e}")
             return None
+
+    @staticmethod
+    def _save_image(normalized, file_name, output_folder):
+        # Ensure the normalized tensor has the correct dimensions [C,H,W] and 3 channels
+        if normalized.dim() != 3 or normalized.shape[0] != 3:
+            print(f"Warning: Normalized tensor for {file_name} has unexpected shape: {normalized.shape}")
+            # Try to reshape if needed
+            if normalized.shape[0] == 1 and normalized.dim() == 3:
+                # Grayscale image - convert to 3 channels
+                normalized = normalized.repeat(3, 1, 1)
+            elif normalized.dim() > 3:
+                # Too many dimensions - squeeze out extra dimensions
+                normalized = normalized.squeeze()
+            
+        # Convert to PIL for saving, ensuring byte format and proper range [0,255]
+        normalized = torch.clamp(normalized, 0, 255).byte()
+        img = transforms.ToPILImage()(normalized)
+        save_path = os.path.join(output_folder, file_name)
+        img.save(save_path)
 
 # Example usage
 if __name__ == "__main__":
