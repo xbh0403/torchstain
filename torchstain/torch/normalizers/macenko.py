@@ -21,29 +21,37 @@ class TorchMacenkoNormalizer(HENormalizer):
     def __convert_rgb2od(self, I, Io, beta):
         I = I.permute(1, 2, 0)
 
+        # Handle zeros to match TileNormalization.py
+        I_reshaped = I.reshape((-1, I.shape[-1])).float()
+        I_reshaped = torch.where(I_reshaped == 0, torch.tensor(1.0, device=I.device), I_reshaped)
+        
         # calculate optical density
-        OD = -torch.log((I.reshape((-1, I.shape[-1])).float() + 1) / Io)
+        OD = -torch.log(I_reshaped / Io)
 
-        # remove transparent pixels
-        ODhat = OD[~torch.any(OD < beta, dim=1)]
+        # remove transparent pixels (same as TileNormalization)
+        ODhat = OD[(OD >= beta).all(dim=1)]
 
         return OD, ODhat
 
     def __find_HE(self, ODhat, eigvecs, alpha):
         # project on the plane spanned by the eigenvectors corresponding to the two
-        # largest eigenvalues
-        That = torch.matmul(ODhat, eigvecs)
+        # largest eigenvalues (eigenvectors 1 and 2, matching TileNormalization.py)
+        That = torch.matmul(ODhat, eigvecs[:, 1:3])
         phi = torch.atan2(That[:, 1], That[:, 0])
 
-        minPhi = percentile(phi, alpha)
-        maxPhi = percentile(phi, 100 - alpha)
+        # Use torch.quantile with alpha/100 to match TileNormalization.py
+        minPhi = torch.quantile(phi, alpha / 100.0)
+        maxPhi = torch.quantile(phi, 1 - alpha / 100.0)
 
-        vMin = torch.matmul(eigvecs, torch.stack((torch.cos(minPhi), torch.sin(minPhi)))).unsqueeze(1)
-        vMax = torch.matmul(eigvecs, torch.stack((torch.cos(maxPhi), torch.sin(maxPhi)))).unsqueeze(1)
+        vMin = torch.matmul(eigvecs[:, 1:3], torch.tensor([[torch.cos(minPhi)], [torch.sin(minPhi)]], device=eigvecs.device))
+        vMax = torch.matmul(eigvecs[:, 1:3], torch.tensor([[torch.cos(maxPhi)], [torch.sin(maxPhi)]], device=eigvecs.device))
 
         # a heuristic to make the vector corresponding to hematoxylin first and the
-        # one corresponding to eosin second
-        HE = torch.where(vMin[0] > vMax[0], torch.cat((vMin, vMax), dim=1), torch.cat((vMax, vMin), dim=1))
+        # one corresponding to eosin second (same as TileNormalization)
+        if vMin[0] > vMax[0]:
+            HE = torch.stack([vMin[:, 0], vMax[:, 0]], dim=1)
+        else:
+            HE = torch.stack([vMax[:, 0], vMin[:, 0]], dim=1)
 
         return HE
 
@@ -60,14 +68,18 @@ class TorchMacenkoNormalizer(HENormalizer):
     def __compute_matrices(self, I, Io, alpha, beta):
         OD, ODhat = self.__convert_rgb2od(I, Io=Io, beta=beta)
 
-        # compute eigenvectors
-        _, eigvecs = torch.linalg.eigh(cov(ODhat.T)) 
-        eigvecs = eigvecs[:, [1, 2]]
+        # compute eigenvectors (match TileNormalization.py)
+        cov_matrix = torch.cov(ODhat.T)
+        eigvals, eigvecs = torch.linalg.eigh(cov_matrix)
 
         HE = self.__find_HE(ODhat, eigvecs, alpha)
 
         C = self.__find_concentration(OD, HE)
-        maxC = torch.stack([percentile(C[0, :], 99), percentile(C[1, :], 99)])
+        # Match TileNormalization.py using quantile
+        maxC = torch.tensor([
+            torch.quantile(C[0, :], 0.99), 
+            torch.quantile(C[1, :], 0.99)
+        ], device=C.device)
 
         return HE, C, maxC
 
